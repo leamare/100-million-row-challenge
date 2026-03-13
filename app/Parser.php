@@ -2,9 +2,12 @@
 
 namespace App;
 
+ini_set('memory_limit', '8192M');
+
 final class Parser
 {
     private const READ_CHUNK = 163_840;
+    private const PATH_SCAN_SIZE = 2_097_152;
     private const PREFIX_LEN = 25; // "https://stitcher.io/blog/"
     private const WRITE_BUF  = 1_048_576;
 
@@ -35,7 +38,38 @@ final class Parser
             }
         }
 
-        $out = [];
+        $dateIdBytes = [];
+        foreach ($dateIds as $date => $id) {
+            $dateIdBytes[$date] = \chr($id & 0xFF) . \chr($id >> 8);
+        }
+
+        $handle = \fopen($inputPath, 'rb');
+        \stream_set_read_buffer($handle, 0);
+        $raw = \fread($handle, \min(self::PATH_SCAN_SIZE, $fileSize));
+        \fclose($handle);
+
+        $pathIds = [];
+        $paths = [];
+        $pathCount = 0;
+        $pos = 0;
+        $lastNl = \strrpos($raw, "\n") ?: 0;
+
+        while ($pos < $lastNl) {
+            $nlPos = \strpos($raw, "\n", $pos + 52);
+            if ($nlPos === false) break;
+
+            $slug = \substr($raw, $pos + self::PREFIX_LEN, $nlPos - $pos - 51);
+            if (!isset($pathIds[$slug])) {
+                $pathIds[$slug] = $pathCount;
+                $paths[$pathCount] = $slug;
+                $pathCount++;
+            }
+
+            $pos = $nlPos + 1;
+        }
+        unset($raw);
+
+        $buckets = \array_fill(0, $pathCount, '');
 
         $handle = \fopen($inputPath, 'rb');
         \stream_set_read_buffer($handle, 0);
@@ -63,41 +97,45 @@ final class Parser
                 $sep = \strpos($chunk, ',', $p);
                 if ($sep === false || $sep >= $lastNl) break;
                 $slug = \substr($chunk, $p, $sep - $p);
-                $date = \substr($chunk, $sep + 3, 8);
-                $dateKey = $dateIds[$date] ?? ('20' . $date);
-                if (!isset($out[$slug])) $out[$slug] = [];
-                $out[$slug][$dateKey] = ($out[$slug][$dateKey] ?? 0) + 1;
+                if (!isset($pathIds[$slug])) {
+                    $pathIds[$slug] = $pathCount;
+                    $paths[$pathCount] = $slug;
+                    $buckets[$pathCount] = '';
+                    $pathCount++;
+                }
+                $buckets[$pathIds[$slug]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
             }
         }
 
         \fclose($handle);
 
-        foreach ($out as &$dateIdCounts) {
-            \ksort($dateIdCounts);
-        }
-        unset($dateIdCounts);
-
-        $this->jsonize($outputPath, $out, $dates);
+        $this->jsonize($outputPath, $buckets, $paths, $dates, $dateCount);
     }
 
-    private function jsonize($filename, &$out, array $dates) {
+    private function jsonize(string $filename, array $buckets, array $paths, array $dates, int $dateCount): void {
+        $datePrefixes = \array_map(fn($d) => '        "20' . $d . '": ', $dates);
+        $escapedPaths = \array_map(fn($p) => "\"\\/blog\\/" . \str_replace('/', '\\/', $p) . '"', $paths);
+
         $file = \fopen($filename, 'wb');
         \stream_set_write_buffer($file, self::WRITE_BUF);
         \fwrite($file, '{');
 
         $isFirst = true;
-        foreach ($out as $k => $ds) {
+        foreach ($paths as $pid => $path) {
+            if ($buckets[$pid] === '') continue;
+
+            $hits = \array_count_values(\unpack('v*', $buckets[$pid]));
+            $dateEntries = [];
+            for ($d = 0; $d < $dateCount; $d++) {
+                if (isset($hits[$d]))
+                    $dateEntries[] = $datePrefixes[$d] . $hits[$d];
+            }
+            if (!$dateEntries) continue;
+
             $buf = $isFirst ? "\n    " : ",\n    ";
             $isFirst = false;
-            $buf .= "\"\\/blog\\/" . \str_replace('/', '\\/', $k) . "\": {\n";
-            $firstDate = true;
-            foreach ($ds as $dateId => $v) {
-                $dateStr = \is_int($dateId) ? '20' . $dates[$dateId] : $dateId;
-                $buf .= ($firstDate ? '' : ",\n") . "        \"$dateStr\": $v";
-                $firstDate = false;
-            }
-            $buf .= "\n    }";
+            $buf .= $escapedPaths[$pid] . ": {\n" . \implode(",\n", $dateEntries) . "\n    }";
             \fwrite($file, $buf);
         }
 
