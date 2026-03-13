@@ -6,7 +6,7 @@ ini_set('memory_limit', '8192M');
 
 final class Parser
 {
-    private const READ_CHUNK = 163_840;
+    private const READ_CHUNK = 262_144;
     private const PATH_SCAN_SIZE = 2_097_152;
     private const PREFIX_LEN = 25; // "https://stitcher.io/blog/"
     private const WRITE_BUF  = 1_048_576;
@@ -69,11 +69,76 @@ final class Parser
         }
         unset($raw);
 
-        $buckets = \array_fill(0, $pathCount, '');
+        $numProcs = \max(1, (int) \shell_exec('nproc') ?: 4);
+        $ranges = $this->splitRanges($inputPath, $fileSize, $numProcs);
 
+        $tmpFiles = [];
+        for ($i = 0; $i < $numProcs; $i++)
+            $tmpFiles[] = \tempnam(\sys_get_temp_dir(), 'mrc_');
+
+        $pids = [];
+        for ($i = 0; $i < $numProcs; $i++) {
+            $pid = \pcntl_fork();
+            if ($pid === -1) throw new \Exception('pcntl_fork failed');
+            if ($pid === 0) {
+                $localBuckets = \array_fill(0, $pathCount, '');
+                $this->processRange(
+                    $inputPath, $ranges[$i][0], $ranges[$i][1],
+                    $pathIds, $dateIdBytes, $localBuckets
+                );
+                $data = '';
+                for ($b = 0; $b < $pathCount; $b++) {
+                    $len = \strlen($localBuckets[$b]);
+                    $data .= \pack('V', $len) . $localBuckets[$b];
+                }
+                \file_put_contents($tmpFiles[$i], $data);
+                exit(0);
+            }
+            $pids[] = $pid;
+        }
+
+        foreach ($pids as $pid) {
+            \pcntl_waitpid($pid, $status);
+        }
+
+        $buckets = \array_fill(0, $pathCount, '');
+        foreach ($tmpFiles as $tmp) {
+            $data = \file_get_contents($tmp);
+            $offset = 0;
+            for ($b = 0; $b < $pathCount; $b++) {
+                $len = \unpack('V', \substr($data, $offset, 4))[1];
+                $offset += 4;
+                $buckets[$b] .= \substr($data, $offset, $len);
+                $offset += $len;
+            }
+            \unlink($tmp);
+        }
+
+        $this->jsonize($outputPath, $buckets, $paths, $dates, $dateCount);
+    }
+
+    private function splitRanges(string $inputPath, int $fileSize, int $n): array
+    {
+        $ranges = [];
+        $handle = \fopen($inputPath, 'rb');
+        $prev = 0;
+        for ($i = 1; $i < $n; $i++) {
+            \fseek($handle, (int) ($fileSize * $i / $n));
+            \fgets($handle);
+            $cur = \ftell($handle);
+            $ranges[] = [$prev, $cur];
+            $prev     = $cur;
+        }
+        $ranges[] = [$prev, $fileSize];
+        \fclose($handle);
+        return $ranges;
+    }
+
+    private function processRange(string $inputPath, int $start, int $end, array $pathIds, array $dateIdBytes, array &$localBuckets): void {
         $handle = \fopen($inputPath, 'rb');
         \stream_set_read_buffer($handle, 0);
-        $remaining = $fileSize;
+        \fseek($handle, $start);
+        $remaining = $end - $start;
 
         while ($remaining > 0) {
             $toRead = $remaining > self::READ_CHUNK ? self::READ_CHUNK : $remaining;
@@ -97,56 +162,47 @@ final class Parser
 
             while ($p < $fence) {
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
                 $sep = \strpos($chunk, ',', $p);
-                $buckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
             }
 
             while ($p < $lastNl) {
                 $sep = \strpos($chunk, ',', $p);
                 if ($sep === false || $sep >= $lastNl) break;
-                $slug = \substr($chunk, $p, $sep - $p);
-                if (!isset($pathIds[$slug])) {
-                    $pathIds[$slug] = $pathCount;
-                    $paths[$pathCount] = $slug;
-                    $buckets[$pathCount] = '';
-                    $pathCount++;
-                }
-                $buckets[$pathIds[$slug]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
+                $localBuckets[$pathIds[\substr($chunk, $p, $sep - $p)]] .= $dateIdBytes[\substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
             }
         }
 
         \fclose($handle);
-
-        $this->jsonize($outputPath, $buckets, $paths, $dates, $dateCount);
     }
 
     private function jsonize(string $filename, array $buckets, array $paths, array $dates, int $dateCount): void {
